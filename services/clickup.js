@@ -71,10 +71,18 @@ async function getTask(taskId) {
     
     return data;
   } catch (error) {
-    if (error.status === 404) {
+    const status = error.status ?? error.response?.status;
+    if (status === 404) {
       const notFoundError = new Error('Task not found');
       notFoundError.status = 404;
+      notFoundError.response = error.response ?? { status: 404 };
       throw notFoundError;
+    }
+    if (status === 400) {
+      const invalidError = new Error('Invalid task ID');
+      invalidError.status = 400;
+      invalidError.response = error.response ?? { status: 400 };
+      throw invalidError;
     }
     throw error;
   }
@@ -100,9 +108,18 @@ async function getComments(taskId) {
     
     return data.comments;
   } catch (error) {
-    if (error.status === 404) {
-      // Task not found, return empty array for comments
-      return [];
+    const status = error.status ?? error.response?.status;
+    if (status === 404) {
+      const notFoundError = new Error('Task not found');
+      notFoundError.status = 404;
+      notFoundError.response = error.response ?? { status: 404 };
+      throw notFoundError;
+    }
+    if (status === 400) {
+      const invalidError = new Error('Invalid task ID');
+      invalidError.status = 400;
+      invalidError.response = error.response ?? { status: 400 };
+      throw invalidError;
     }
     throw error;
   }

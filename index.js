@@ -22,9 +22,12 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// Validate task ID format (ClickUp task IDs are typically alphanumeric)
+// Validate task ID format (ClickUp task IDs are alphanumeric, e.g. "8xdfdjbgd")
 function isValidTaskId(taskId) {
-  return taskId && typeof taskId === 'string' && taskId.trim().length > 0;
+  if (!taskId || typeof taskId !== 'string') return false;
+  const trimmed = taskId.trim();
+  if (trimmed.length < 2) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed);
 }
 
 // Handle task command
@@ -35,20 +38,20 @@ async function handleTaskCommand(interaction) {
   
   if (!isValidTaskId(taskId)) {
     return interaction.editReply({
-      content: 'Invalid task ID. Please provide a valid ClickUp task ID.',
+      content: '**Invalid task ID.** Please provide a valid ClickUp task ID (e.g. alphanumeric, like `8xdfdjbgd`).',
     });
   }
-  
+
   const task = await getTask(taskId.trim());
-  
+
   if (!task || !task.name) {
     return interaction.editReply({
-      content: 'Task not found. Please check the task ID and try again.',
+      content: '**Task not found.** No task exists with that ID. Please check the task ID and try again.',
     });
   }
-  
+
   const embed = new EmbedBuilder()
-    .setTitle(task.name || 'Untitled Task')
+    .setTitle(task.name)
     .setURL(task.url || null)
     .addFields(
       { name: 'Status', value: task.status?.status || 'Unknown', inline: true }
@@ -65,12 +68,12 @@ async function handleCommentCommand(interaction) {
   
   if (!isValidTaskId(taskId)) {
     return interaction.editReply({
-      content: 'Invalid task ID. Please provide a valid ClickUp task ID.',
+      content: '**Invalid task ID.** Please provide a valid ClickUp task ID (e.g. alphanumeric, like `8xdfdjbgd`).',
     });
   }
-  
+
   const comments = await getComments(taskId.trim());
-  
+
   if (!comments || !comments.length) {
     return interaction.editReply({
       content: 'No comments found for this task.',
@@ -95,16 +98,20 @@ async function handleCommentCommand(interaction) {
 
 // Handle errors with appropriate user messages
 function handleError(interaction, error) {
-  const errorMessage = error.response?.status === 404
-    ? '⚠️ Task not found. Please check the task ID and try again.'
-    : error.response?.status === 401
-    ? '⚠️ Authentication failed. Please check API credentials.'
-    : error.response?.status === 403
-    ? '⚠️ Access denied. Please check permissions.'
-    : error.code === 'ECONNABORTED' || error.message?.includes('timeout')
-    ? '⚠️ Request timed out. Please try again later.'
-    : '⚠️ Failed to fetch ClickUp data. Please try again later.';
-  
+  const status = error.status ?? error.response?.status;
+  const errorMessage =
+    status === 404
+      ? '**Task not found.** No task exists with that ID. Please check the task ID and try again.'
+      : status === 400 || error.message === 'Invalid task ID'
+      ? '**Invalid task ID.** The task ID format is invalid or not recognized by ClickUp. Please provide a valid task ID.'
+      : status === 401
+      ? '**Authentication failed.** Please check API credentials.'
+      : status === 403
+      ? '**Access denied.** Please check permissions.'
+      : error.code === 'ECONNABORTED' || error.message?.includes('timeout')
+      ? '**Request timed out.** Please try again later.'
+      : '**Failed to fetch ClickUp data.** Please try again later.';
+
   if (interaction.deferred || interaction.replied) {
     return interaction.editReply({ content: errorMessage });
   }
@@ -112,7 +119,7 @@ function handleError(interaction, error) {
 }
 
 // Ready event handler
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`✅ Bot is ready! Serving ${client.guilds.cache.size} guild(s)`);
 });
@@ -138,14 +145,29 @@ client.on('interactionCreate', async (interaction) => {
       await handleCommentCommand(interaction);
     }
   } catch (error) {
-    console.error(`Error handling ${interaction.commandName} command:`, {
-      error: error.message,
-      stack: error.stack,
-      taskId: interaction.options?.getString('task_id'),
-      userId: interaction.user?.id,
-      guildId: interaction.guildId,
-    });
-    handleError(interaction, error);
+    const status = error.status ?? error.response?.status;
+    const isExpectedUserError = status === 404 || status === 400;
+
+    if (isExpectedUserError) {
+      console.warn(
+        `[${interaction.commandName}] Task not found or invalid ID:`,
+        { taskId: interaction.options?.getString('task_id'), status }
+      );
+    } else {
+      console.error(`Error handling ${interaction.commandName} command:`, {
+        error: error.message,
+        stack: error.stack,
+        taskId: interaction.options?.getString('task_id'),
+        userId: interaction.user?.id,
+        guildId: interaction.guildId,
+      });
+    }
+
+    try {
+      await handleError(interaction, error);
+    } catch (replyError) {
+      console.error('Failed to send error reply to user:', replyError.message);
+    }
   }
 });
 
