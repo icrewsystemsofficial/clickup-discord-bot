@@ -34,6 +34,7 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     const status = error.response?.status;
+    const apiError = error.response?.data?.error;
     const message =
       error.response?.data?.message ||
       error.response?.data?.err ||
@@ -43,6 +44,7 @@ api.interceptors.response.use(
     const customError = new Error(message);
     customError.status = status;
     customError.response = error.response;
+    customError.apiError = apiError;
     throw customError;
   }
 );

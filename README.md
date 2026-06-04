@@ -20,6 +20,7 @@ Example messages:
 @bot how many overdue tasks are there for software team?
 @bot issue an LoA to @santhosh today
 @bot schedule a 30 minutes meeting with @akshay about overdue tasks today
+@bot schedule meeting for santhoshr0415@gmail.com and ajayvijay7723@gmail.com title: TASK are pending and project update
 ```
 
 The mention agent uses the Cerebro AI Agent API endpoints from `Cerebro AI Agent API.postman_collection.json`:
@@ -49,6 +50,7 @@ Write actions supported:
 
 - Create an approved one-day LoA for a mentioned Discord user.
 - Schedule a Google Calendar meeting with a mentioned Discord user, with overdue ClickUp task gist lines added to the meeting description when requested.
+- Schedule a Google Calendar meeting with direct email attendees using `title:`.
 
 ## Environment Variables
 

@@ -137,6 +137,13 @@ function extractStartTime(question) {
   return `${String(hour).padStart(2, '0')}:${minute}`;
 }
 
+function extractEmails(question) {
+  return [...new Set(
+    [...question.matchAll(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)]
+      .map((match) => match[0].toLowerCase())
+  )];
+}
+
 function extractDateKeyword(question) {
   const isoDate = question.match(/\b\d{4}-\d{2}-\d{2}\b/);
   if (isoDate) return isoDate[0];
@@ -160,6 +167,12 @@ function extractDateKeyword(question) {
 }
 
 function extractMeetingTopic(question) {
+  const titleMatch = question.match(/\btitle\s*:\s*["“]?(.+?)["”]?\s*$/i);
+  if (titleMatch) return titleMatch[1].trim();
+
+  const quoted = question.match(/["“](.+?)["”]/);
+  if (quoted) return quoted[1].trim();
+
   const match = question.match(/\b(?:about|to talk about|regarding)\s+(.+)$/i);
   return match ? match[1].trim() : 'Meeting scheduled by Icrew AI agent';
 }
@@ -338,6 +351,7 @@ async function replyInteractionWithAgentHelp(interaction) {
         value: [
           '`@Icrew issue an LoA to Leo today`',
           '`@Icrew schedule a 30 minutes meeting with Akshay about overdue tasks today`',
+          '`@Icrew schedule meeting for one@example.com and two@example.com title: Project update`',
           'Write actions need confirmation-safe Cerebro APIs before changing database/calendar records.',
         ].join('\n'),
       }
@@ -501,11 +515,12 @@ async function handleLoaAction(message, question) {
 }
 
 async function handleMeetingAction(message, question) {
-  const target = getMentionedUsers(message)[0];
+  const mentionedUsers = getMentionedUsers(message);
+  const emails = extractEmails(question);
 
-  if (!target) {
+  if (!mentionedUsers.length && !emails.length) {
     await message.reply({
-      content: 'Please mention who the meeting is with, for example `@Icrew schedule a 30 minutes meeting with @Akshay about overdue tasks today`.',
+      content: 'Please mention who the meeting is with or provide emails, for example `@Icrew schedule meeting for user@example.com and other@example.com title: Project update`.',
       allowedMentions: { parse: [] },
     });
     return;
@@ -517,7 +532,8 @@ async function handleMeetingAction(message, question) {
   const topic = extractMeetingTopic(question);
   const response = await scheduleMeeting({
     requester_discord_id: message.author.id,
-    attendee_discord_ids: [target.id],
+    attendee_discord_ids: mentionedUsers.map((user) => user.id),
+    attendee_emails: emails,
     date,
     start_time: startTime || undefined,
     duration_minutes: duration,
@@ -526,15 +542,17 @@ async function handleMeetingAction(message, question) {
     include_overdue_tasks: /\boverdue\b/i.test(question),
   });
   const meeting = response.data;
+  const targetMentions = mentionedUsers.map((user) => `<@${user.id}>`);
+  const targetText = [...targetMentions, ...emails].join(', ');
 
   await message.reply({
     content: [
-      `Meeting scheduled with <@${target.id}>.`,
+      `Meeting scheduled with ${targetText}.`,
       `${meeting.date} ${meeting.start_time}-${meeting.end_time} (${meeting.duration_minutes} minutes)`,
       meeting.task_gist_count ? `Added ${meeting.task_gist_count} overdue-task gist line(s) to the description.` : 'No overdue-task gist was added.',
       meeting.google_event_link ? `Calendar: ${meeting.google_event_link}` : `Google event ID: ${meeting.google_event_id || 'not returned'}`,
     ].join('\n'),
-    allowedMentions: { parse: [], users: [target.id] },
+    allowedMentions: { parse: [], users: mentionedUsers.map((user) => user.id) },
   });
 }
 
@@ -975,7 +993,7 @@ client.on('messageCreate', async (message) => {
         : isAuthError
         ? 'I could not access the Cerebro AI Agent API. Please check the API token and permissions.'
         : isValidationError
-        ? `Cerebro could not complete that action: ${error.message}`
+        ? `Cerebro could not complete that action: ${error.message}${error.apiError ? `\n${error.apiError}` : ''}`
         : 'I could not fetch those details right now. Please try again later.'
     );
   }
