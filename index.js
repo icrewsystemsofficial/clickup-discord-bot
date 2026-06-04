@@ -1,12 +1,17 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const { 
   Client, 
   GatewayIntentBits, 
-  EmbedBuilder 
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 
 const { getTask, getComments } = require('./services/clickup');
+const { answerNaturalLanguageQuestion } = require('./services/aiAgent');
+const { getSopDetails } = require('./services/cerebro');
 
 // Validate required environment variables
 const requiredEnvVars = ['DISCORD_TOKEN', 'CLICKUP_API_TOKEN'];
@@ -19,8 +24,167 @@ if (missingEnvVars.length > 0) {
 
 // Create Discord client
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
+
+function stripBotMention(content, botUserId) {
+  return content
+    .replace(new RegExp(`<@!?${botUserId}>`, 'g'), '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getMentionedUsers(message) {
+  return message.mentions.users
+    .filter((user) => user.id !== message.client.user.id)
+    .map((user) => {
+      const member = message.guild?.members.cache.get(user.id);
+      return {
+        id: user.id,
+        username: user.username,
+        displayName: member?.displayName || user.globalName || user.username,
+      };
+    });
+}
+
+function getDiscordIdsFromText(text) {
+  return [...new Set([...text.matchAll(/<@!?(\d{15,25})>/g)].map((match) => match[1]))];
+}
+
+function getUniqueDiscordIds(values) {
+  const ids = new Set();
+
+  values.forEach((value) => {
+    const match = String(value || '').match(/\d{15,25}/);
+    if (match) ids.add(match[0]);
+  });
+
+  return [...ids].slice(0, 100);
+}
+
+function asArray(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return payload ? [payload] : [];
+}
+
+function wantsSopDropdown(question) {
+  return /\b(sop|procedure|policy)\b/i.test(question) &&
+    /\b(all|list|dropdown|select|show)\b/i.test(question);
+}
+
+function buildSopSelectMenu(sops) {
+  const options = sops
+    .filter((sop) => sop.key && sop.title)
+    .slice(0, 25)
+    .map((sop) => ({
+      label: String(sop.title).slice(0, 100),
+      description: String(sop.url ? 'Cabinet link available' : 'No Cabinet link configured').slice(0, 100),
+      value: String(sop.key).slice(0, 100),
+    }));
+
+  if (!options.length) return [];
+
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('sop_select')
+        .setPlaceholder('Select an SOP')
+        .addOptions(options)
+    ),
+  ];
+}
+
+async function replyWithSopDropdown(message) {
+  const data = await getSopDetails();
+  const sops = asArray(data);
+  const components = buildSopSelectMenu(sops);
+
+  if (!components.length) {
+    await message.reply('No SOP details found.');
+    return true;
+  }
+
+  await message.reply({
+    content: 'Select an SOP to get the Cabinet link.',
+    components,
+    allowedMentions: { parse: [] },
+  });
+  return true;
+}
+
+async function handleSopSelect(interaction) {
+  const selectedKey = interaction.values?.[0];
+  const data = await getSopDetails();
+  const sop = asArray(data).find((item) => item.key === selectedKey);
+
+  if (!sop) {
+    await interaction.reply({
+      content: 'I could not find that SOP anymore. Please ask for the SOP list again.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: sop.url
+      ? `**${sop.title}**\n${sop.url}`
+      : `**${sop.title}**\nNo Cabinet link is configured for this SOP.`,
+    ephemeral: true,
+    allowedMentions: { parse: [] },
+  });
+}
+
+async function handleBotMention(message) {
+  if (!message.mentions.has(client.user)) return;
+
+  const question = stripBotMention(message.content, client.user.id);
+
+  if (!question) {
+    await message.reply(
+      'Ask me about attendance, clock-in details, ClickUp tasks, or SOP details.'
+    );
+    return;
+  }
+
+  await message.channel.sendTyping();
+
+  if (wantsSopDropdown(question)) {
+    await replyWithSopDropdown(message);
+    return;
+  }
+
+  const requesterMember = message.guild?.members.cache.get(message.author.id);
+  const answer = await answerNaturalLanguageQuestion({
+    question,
+    requester: {
+      id: message.author.id,
+      username: message.author.username,
+      displayName:
+        requesterMember?.displayName ||
+        message.author.globalName ||
+        message.author.username,
+    },
+    mentionedUsers: getMentionedUsers(message),
+  });
+  const allowedUserIds = getUniqueDiscordIds([
+    message.author.id,
+    ...getMentionedUsers(message).map((user) => user.id),
+    ...getDiscordIdsFromText(answer),
+  ]);
+
+  await message.reply({
+    content: answer,
+    allowedMentions: {
+      parse: [],
+      users: allowedUserIds,
+    },
+  });
+}
 
 // Validate task ID format (ClickUp task IDs are alphanumeric, e.g. "8xdfdjbgd")
 function isValidTaskId(taskId) {
@@ -136,6 +300,32 @@ client.on('warn', (warning) => {
 
 // Interaction handler
 client.on('interactionCreate', async (interaction) => {
+  if (interaction.isStringSelectMenu()) {
+    try {
+      if (interaction.customId === 'sop_select') {
+        await handleSopSelect(interaction);
+      }
+    } catch (error) {
+      console.error('Error handling SOP select menu:', {
+        error: error.message,
+        userId: interaction.user?.id,
+        guildId: interaction.guildId,
+      });
+
+      const reply = {
+        content: 'I could not fetch that SOP link right now. Please try again later.',
+        ephemeral: true,
+      };
+
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(reply);
+      } else {
+        await interaction.reply(reply);
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   try {
@@ -168,6 +358,33 @@ client.on('interactionCreate', async (interaction) => {
     } catch (replyError) {
       console.error('Failed to send error reply to user:', replyError.message);
     }
+  }
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !client.user) return;
+
+  try {
+    await handleBotMention(message);
+  } catch (error) {
+    const status = error.status ?? error.response?.status;
+    const isAuthError = status === 401 || status === 403;
+    const isConfigError = error.message?.includes('CEREBRO_AI_AGENT_TOKEN');
+
+    console.error('Error handling bot mention:', {
+      error: error.message,
+      status,
+      userId: message.author?.id,
+      guildId: message.guildId,
+    });
+
+    await message.reply(
+      isConfigError
+        ? 'CEREBRO_AI_AGENT_TOKEN is missing. Please add it to the bot environment.'
+        : isAuthError
+        ? 'I could not access the Cerebro AI Agent API. Please check the API token and permissions.'
+        : 'I could not fetch those details right now. Please try again later.'
+    );
   }
 });
 
