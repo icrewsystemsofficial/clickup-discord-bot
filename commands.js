@@ -29,7 +29,10 @@ const commands = [
       opt.setName('task_id')
         .setDescription('ClickUp Task ID')
         .setRequired(true)
-    )
+    ),
+  new SlashCommandBuilder()
+    .setName('icrew-help')
+    .setDescription('Show what the Icrew agent can do')
 ].map(cmd => cmd.toJSON());
 
 // Create REST client

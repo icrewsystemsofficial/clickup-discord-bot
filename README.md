@@ -13,6 +13,13 @@ Example messages:
 @bot attendance details for @santhosh today
 @bot all staff overdue tasks
 @bot show all sop list
+@bot @santhosh status
+@bot my dashboard
+@bot help
+@bot who clocked in today but did not do any tasks?
+@bot how many overdue tasks are there for software team?
+@bot issue an LoA to @santhosh today
+@bot schedule a 30 minutes meeting with @akshay about overdue tasks today
 ```
 
 The mention agent uses the Cerebro AI Agent API endpoints from `Cerebro AI Agent API.postman_collection.json`:
@@ -28,6 +35,20 @@ The mention agent uses the Cerebro AI Agent API endpoints from `Cerebro AI Agent
 Answers include Discord mentions like `<@discord_id>` when the Cerebro API returns a Discord ID.
 
 When the user asks for all SOPs or an SOP list, the bot shows a Discord dropdown. Selecting an SOP replies with the Cabinet URL.
+
+When the user asks for a status, dashboard, overview, or summary, the bot replies with an attendance and ClickUp dashboard card plus quick action buttons for pending tasks, overdue tasks, and clock-in details.
+
+Run `/icrew-help` in Discord to see the agent examples and current capabilities.
+
+Analytics currently supported:
+
+- Clocked in today but no ClickUp tasks due today.
+- Overdue ClickUp task count by team-like keyword such as software, operations, HR, or PR.
+
+Write actions supported:
+
+- Create an approved one-day LoA for a mentioned Discord user.
+- Schedule a Google Calendar meeting with a mentioned Discord user, with overdue ClickUp task gist lines added to the meeting description when requested.
 
 ## Environment Variables
 

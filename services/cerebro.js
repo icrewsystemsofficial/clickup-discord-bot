@@ -95,10 +95,25 @@ async function getSopDetails({ filter } = {}) {
   return data;
 }
 
+async function createLoaForDiscordUser(discordId, payload = {}) {
+  const { data } = await api.post(
+    `/api/v1/ai-agent/discord-users/${encodeURIComponent(discordId)}/loa`,
+    payload
+  );
+  return data;
+}
+
+async function scheduleMeeting(payload = {}) {
+  const { data } = await api.post('/api/v1/ai-agent/meetings', payload);
+  return data;
+}
+
 module.exports = {
   getStaffUsers,
   getUserByDiscordId,
   getClockInDetails,
   getClickUpTasks,
   getSopDetails,
+  createLoaForDiscordUser,
+  scheduleMeeting,
 };
