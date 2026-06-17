@@ -7,6 +7,14 @@ const {
   getClickUpTasks,
   getSopDetails,
 } = require('./cerebro');
+const {
+  formatAttendanceMessage,
+  formatClickUpTasksMessage,
+  formatFallbackHelpMessage,
+  formatSopMessage,
+  formatStaffMessage,
+  extractMentionIds,
+} = require('./discordFormat');
 
 const promptPath = path.join(__dirname, '..', 'prompts', 'cerebro-ai-agent.md');
 const systemPrompt = fs.readFileSync(promptPath, 'utf8');
@@ -15,7 +23,6 @@ const DEFAULT_MODEL = 'openrouter/free';
 const OPENROUTER_CHAT_COMPLETIONS_URL =
   process.env.OPENROUTER_BASE_URL ||
   'https://openrouter.ai/api/v1/chat/completions';
-const MAX_DISCORD_MESSAGE_LENGTH = 1900;
 
 function getOpenRouterModel() {
   const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
@@ -85,16 +92,18 @@ function buildFallbackPlan({ question, requester, mentionedUsers }) {
   const lower = question.toLowerCase();
   const date = extractDate(question);
   const mentioned = mentionedUsers.filter((user) => user.id !== requester.id);
+  const wantsRequester =
+    /\b(my|me|mine|myself|for me)\b/.test(lower);
   const wantsAll =
-    /\b(all users|all staff|everyone|every one|team)\b/.test(lower);
+    /\b(all users|all staff|everyone|every one|team|who|who all|how many|how much|users|staff)\b/.test(lower);
   const wantsClockIn =
-    /\b(attendance|attendcae|clock ?in|clocin|clock-in|clock out|clock-out|punch ?in|punch ?out|login|work hours)\b/.test(lower);
+    /\b(attendance|attendcae|clock ?in|clocked ?in|clocin|clock-in|clocked-in|clock out|clock-out|punched ?in|punch ?in|punch ?out|login|work hours)\b/.test(lower);
   const wantsTasks =
     /\b(clickup|task|tasks)\b/.test(lower);
   const actions = [];
 
   if (wantsClockIn) {
-    if (wantsAll) {
+    if (wantsAll || (!mentioned.length && !wantsRequester)) {
       actions.push({
         type: 'clock_in_details',
         scope: 'all',
@@ -160,7 +169,7 @@ function buildFallbackPlan({ question, requester, mentionedUsers }) {
 function shouldUseDeterministicPlan(context) {
   const lower = context.question.toLowerCase();
   return (
-    /\b(attendance|attendcae|clock ?in|clocin|clock-in|clock out|clock-out|punch ?in|punch ?out|login|work hours|clickup|task|tasks|sop|procedure|policy)\b/.test(lower) ||
+    /\b(attendance|attendcae|clock ?in|clocked ?in|clocin|clock-in|clocked-in|clock out|clock-out|punched ?in|punch ?in|punch ?out|login|work hours|clickup|task|tasks|sop|procedure|policy)\b/.test(lower) ||
     context.mentionedUsers.length > 0
   );
 }
@@ -466,24 +475,6 @@ function getTasksFromPayload(payload) {
   return payload ? [payload] : [];
 }
 
-function formatTaskLine(task, index) {
-  const name = task.name || task.title || `Task ${index + 1}`;
-  const status = task.status?.status || task.status || task.state || 'unknown';
-  const dueDate = task.due_date || task.dueDate || task.due;
-  const url = task.url || task.link || task.task_url;
-  const ownerId = pickDiscordId(task.staff_user || task.user || {}, '');
-  const owner = ownerId ? ` <@${ownerId}>` : '';
-  const due = dueDate ? `, due: ${formatDateTime(dueDate)}` : '';
-  const link = url ? ` - ${url}` : '';
-  return `- ${name}${owner} (${status}${due})${link}`;
-}
-
-function formatSopLine(item) {
-  const title = item.title || item.name || item.label || item.key || 'SOP';
-  const url = item.url || item.link;
-  return `- ${title}${url ? ` - ${url}` : ''}`;
-}
-
 function filterSopItems(items, filter) {
   if (!filter) return items;
   const needle = filter.toLowerCase();
@@ -504,9 +495,20 @@ function filterSopItems(items, filter) {
   });
 }
 
-function truncateMessage(message) {
-  if (message.length <= MAX_DISCORD_MESSAGE_LENGTH) return message;
-  return `${message.slice(0, MAX_DISCORD_MESSAGE_LENGTH - 80)}\n...truncated. Please narrow the question for more details.`;
+function formatTaskForEmbed(task, index) {
+  const ownerId = pickDiscordId(task.staff_user || task.user || {}, '');
+  return {
+    name: task.name || task.title || `Task ${index + 1}`,
+    title: task.name || task.title || `Task ${index + 1}`,
+    status: task.status?.status || task.status || task.state || 'unknown',
+    due_date: task.due_date || task.dueDate || task.due,
+    dueDate: task.due_date || task.dueDate || task.due,
+    due: task.due_date || task.dueDate || task.due,
+    url: task.url || task.link || task.task_url,
+    link: task.url || task.link || task.task_url,
+    task_url: task.url || task.link || task.task_url,
+    ownerDiscordId: ownerId,
+  };
 }
 
 async function executeAction(action) {
@@ -520,11 +522,24 @@ async function executeAction(action) {
     const lines = formatClockPayload(data, discordId);
     const title =
       action.scope === 'all'
-        ? `Attendance details${action.date ? ` for ${action.date}` : ''}`
-        : `Attendance details for <@${discordId}>${action.date ? ` on ${action.date}` : ''}`;
+        ? 'Attendance Details'
+        : 'Attendance Details';
+    const subtitle =
+      action.scope === 'all'
+        ? 'All staff'
+        : `<@${discordId}>`;
 
-    if (!lines.length) return `${title}\nNo attendance records found.`;
-    return `${title}\n${lines.slice(0, 20).join('\n')}`;
+    const content = formatAttendanceMessage({
+      title,
+      subtitle,
+      lines: lines.slice(0, 20),
+      date: action.date || undefined,
+    });
+
+    return {
+      content,
+      userIds: action.scope === 'all' ? extractMentionIds(lines) : [discordId],
+    };
   }
 
   if (action.type === 'clickup_tasks') {
@@ -533,54 +548,80 @@ async function executeAction(action) {
       filter: action.filter || 'pending',
       date: action.date,
     });
-    const tasks = getTasksFromPayload(data);
-    const title =
-      action.scope === 'all'
-        ? `ClickUp ${action.filter || 'pending'} tasks for all staff`
-        : `ClickUp ${action.filter || 'pending'} tasks for <@${discordId}>`;
+    const tasks = getTasksFromPayload(data).slice(0, 10).map(formatTaskForEmbed);
+    const content = formatClickUpTasksMessage({
+      filter: action.filter || 'pending',
+      scope: action.scope,
+      discordId,
+      tasks,
+      date: action.date || undefined,
+    });
 
-    if (!tasks.length) return `${title}\nNo ClickUp tasks found.`;
-    return `${title}\n${tasks.slice(0, 10).map(formatTaskLine).join('\n')}`;
+    return {
+      content,
+      userIds: action.scope === 'all'
+        ? tasks.map((task) => task.ownerDiscordId).filter(Boolean)
+        : [discordId],
+    };
   }
 
   if (action.type === 'staff_users') {
-    const users = asArray(await getStaffUsers());
-    if (!users.length) return 'No staff users found.';
-    return `Staff users\n${users
+    const users = asArray(await getStaffUsers())
       .slice(0, 20)
-      .map((user) => {
-        const userDiscordId = pickDiscordId(user, '');
-        return `- ${userDiscordId ? `<@${userDiscordId}>` : pickUserName(user)}: ${pickUserName(user)}`;
-      })
-      .join('\n')}`;
+      .map((user) => ({
+        discordId: pickDiscordId(user, ''),
+        name: pickUserName(user),
+      }));
+
+    return {
+      content: formatStaffMessage({ users }),
+      userIds: users.map((user) => user.discordId).filter(Boolean),
+    };
   }
 
   if (action.type === 'sop_details') {
     const data = await getSopDetails({ filter: action.filter });
-    const items = filterSopItems(asArray(data), action.filter);
-    if (!items.length) return 'No SOP details found.';
-    return `SOP details\n${items
-      .slice(0, 10)
-      .map(formatSopLine)
-      .join('\n')}`;
+    const items = filterSopItems(asArray(data), action.filter).slice(0, 10);
+
+    return {
+      content: formatSopMessage({ items, filter: action.filter || undefined }),
+      userIds: [],
+    };
   }
 
-  return '';
+  return { content: '', userIds: [] };
 }
 
 async function answerNaturalLanguageQuestion(context) {
   const plan = await planWithOpenRouter(context);
 
   if (!plan.actions?.length) {
-    return 'I can help with attendance, clock-in details, ClickUp tasks, staff lookup, and SOP details. Please mention the bot with one of those questions.';
+    return {
+      content: formatFallbackHelpMessage(),
+      userIds: [],
+    };
   }
 
-  const answers = [];
+  const parts = [];
+  const userIds = new Set();
+
   for (const action of plan.actions.slice(0, 4)) {
-    answers.push(await executeAction(action));
+    const result = await executeAction(action);
+    if (result.content) parts.push(result.content);
+    result.userIds.forEach((id) => userIds.add(id));
   }
 
-  return truncateMessage(answers.filter(Boolean).join('\n\n'));
+  if (!parts.length) {
+    return {
+      content: formatFallbackHelpMessage(),
+      userIds: [],
+    };
+  }
+
+  return {
+    content: parts.join('\n\n'),
+    userIds: [...userIds],
+  };
 }
 
 module.exports = {

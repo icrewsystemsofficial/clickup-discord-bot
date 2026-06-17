@@ -105,11 +105,6 @@ async function createLoaForDiscordUser(discordId, payload = {}) {
   return data;
 }
 
-async function scheduleMeeting(payload = {}) {
-  const { data } = await api.post('/api/v1/ai-agent/meetings', payload);
-  return data;
-}
-
 module.exports = {
   getStaffUsers,
   getUserByDiscordId,
@@ -117,5 +112,4 @@ module.exports = {
   getClickUpTasks,
   getSopDetails,
   createLoaForDiscordUser,
-  scheduleMeeting,
 };

@@ -1,5 +1,5 @@
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 
 const { 
   Client, 
@@ -9,6 +9,7 @@ const {
   StringSelectMenuBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionsBitField,
 } = require('discord.js');
 
 const { getTask, getComments } = require('./services/clickup');
@@ -18,8 +19,27 @@ const {
   getClockInDetails,
   getClickUpTasks,
   getSopDetails,
-  scheduleMeeting,
 } = require('./services/cerebro');
+const {
+  formatDisplayDate,
+  formatDisplayTime,
+  processMeetingMessage,
+  wantsMeetingAction,
+} = require('./services/meeting');
+const {
+  buildDashboardEmbed,
+  buildHelpEmbed,
+  buildMeetingSuccessEmbed,
+  formatLoaSuccessMessage,
+  formatMeetingPromptMessage,
+  formatNoTasksAnalyticsMessage,
+  formatOverdueTeamMessage,
+  formatClockDetailsMessage,
+  formatTaskListMessage,
+  formatWelcomeMessage,
+  formatWhoClockedInMessage,
+  toReplyPayload,
+} = require('./services/discordFormat');
 
 // Validate required environment variables
 const requiredEnvVars = ['DISCORD_TOKEN', 'CLICKUP_API_TOKEN'];
@@ -59,10 +79,6 @@ function getMentionedUsers(message) {
     });
 }
 
-function getDiscordIdsFromText(text) {
-  return [...new Set([...text.matchAll(/<@!?(\d{15,25})>/g)].map((match) => match[1]))];
-}
-
 function getUniqueDiscordIds(values) {
   const ids = new Set();
 
@@ -99,6 +115,13 @@ function wantsClockedInNoTasksAnalytics(question) {
     /\b(no tasks|without tasks|didn'?t.*tasks|not.*tasks|no work|didn'?t really do)\b/i.test(question);
 }
 
+function wantsWhoClockedIn(question) {
+  return /\b(who|who all|how|how many|how much|all users|all staff|everyone|every one|team|staff|users)\b/i.test(question) &&
+    /\b(clocked in|clocked-in|clockin|clock-in|attendance)\b/i.test(question) &&
+    !/\b(my|me|mine)\b/i.test(question) &&
+    !/\b(no tasks|without tasks|didn'?t.*tasks|not.*tasks|no work|didn'?t really do)\b/i.test(question);
+}
+
 function wantsOverdueTeamAnalytics(question) {
   return /\boverdue\b/i.test(question) &&
     /\b(task|tasks|clickup)\b/i.test(question) &&
@@ -107,41 +130,11 @@ function wantsOverdueTeamAnalytics(question) {
 
 function wantsWriteAction(question) {
   return /\b(issue|mark|create|apply|add)\b.*\b(loa|leave|awol)\b/i.test(question) ||
-    /\b(schedule|create|book|set up)\b.*\b(meeting|calendar)\b/i.test(question);
+    wantsMeetingAction(question);
 }
 
 function wantsLoaAction(question) {
   return /\b(issue|mark|create|apply|add)\b.*\b(loa|leave|awol)\b/i.test(question);
-}
-
-function wantsMeetingAction(question) {
-  return /\b(schedule|create|book|set up)\b.*\b(meeting|calendar)\b/i.test(question);
-}
-
-function extractDurationMinutes(question) {
-  const match = question.match(/\b(\d{1,3})\s*(minutes?|mins?|m)\b/i);
-  return match ? Number(match[1]) : 30;
-}
-
-function extractStartTime(question) {
-  const match = question.match(/\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm)?\b/i);
-  if (!match) return '';
-
-  let hour = Number(match[1]);
-  const minute = match[2] || '00';
-  const meridiem = match[3]?.toLowerCase();
-
-  if (meridiem === 'pm' && hour < 12) hour += 12;
-  if (meridiem === 'am' && hour === 12) hour = 0;
-
-  return `${String(hour).padStart(2, '0')}:${minute}`;
-}
-
-function extractEmails(question) {
-  return [...new Set(
-    [...question.matchAll(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)]
-      .map((match) => match[0].toLowerCase())
-  )];
 }
 
 function extractDateKeyword(question) {
@@ -164,17 +157,6 @@ function extractDateKeyword(question) {
     }).format(date);
   }
   return '';
-}
-
-function extractMeetingTopic(question) {
-  const titleMatch = question.match(/\btitle\s*:\s*["“]?(.+?)["”]?\s*$/i);
-  if (titleMatch) return titleMatch[1].trim();
-
-  const quoted = question.match(/["“](.+?)["”]/);
-  if (quoted) return quoted[1].trim();
-
-  const match = question.match(/\b(?:about|to talk about|regarding)\s+(.+)$/i);
-  return match ? match[1].trim() : 'Meeting scheduled by Icrew AI agent';
 }
 
 function getDashboardTarget(message) {
@@ -219,42 +201,6 @@ function getGroupedTaskItems(payload) {
   }));
 }
 
-function formatDateTime(value) {
-  if (!value) return 'not set';
-  if (typeof value === 'number') {
-    const date = new Date(value > 9999999999 ? value : value * 1000);
-    return date.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  }
-  return String(value);
-}
-
-function formatTaskPreview(task, index) {
-  const name = task.name || task.title || `Task ${index + 1}`;
-  const status = task.status?.status || task.status || 'unknown';
-  const due = task.due || task.due_date || task.dueDate;
-  const url = task.url || task.link || task.task_url;
-  return `- ${name} (${status}, due: ${formatDateTime(due)})${url ? `\n  ${url}` : ''}`;
-}
-
-function formatClockDetails(payload, discordId) {
-  const records = asArray(payload.clock_ins || payload.records || payload.data);
-  const currentClockIn = payload.current_clock_in;
-  const isClockedIn = payload.is_clocked_in ? 'currently clocked in' : 'not clocked in now';
-
-  if (!records.length && !currentClockIn) {
-    return `Clock-in details for <@${discordId}>\n- No clock-in record found today, ${isClockedIn}`;
-  }
-
-  const lines = records.slice(0, 8).map((record) => {
-    const inTime = record.in_time || record.clock_in || record.clockIn;
-    const outTime = record.out_time || record.clock_out || record.clockOut;
-    const duration = record.duration || record.total_hours || record.work_hours;
-    return `- in: ${formatDateTime(inTime)}, out: ${formatDateTime(outTime)}${duration ? `, duration: ${duration}` : ''}`;
-  });
-
-  return `Clock-in details for <@${discordId}>\n- ${isClockedIn}\n${lines.join('\n')}`;
-}
-
 function buildDashboardButtons(discordId) {
   return [
     new ActionRowBuilder().addComponents(
@@ -275,90 +221,46 @@ function buildDashboardButtons(discordId) {
 }
 
 async function replyWithAgentHelp(message) {
-  const embed = new EmbedBuilder()
-    .setTitle('Icrew Agent Help')
-    .setDescription('Ask me natural-language questions about attendance, ClickUp tasks, SOPs, and staff status.')
-    .addFields(
-      {
-        name: 'Attendance',
-        value: [
-          '`@Icrew who clocked in today?`',
-          '`@Icrew @Santhosh clockin details`',
-          '`@Icrew who clocked in today but did not do any tasks?`',
-        ].join('\n'),
-      },
-      {
-        name: 'ClickUp Analytics',
-        value: [
-          '`@Icrew @Santhosh status`',
-          '`@Icrew @Santhosh overdue tasks`',
-          '`@Icrew how many overdue tasks are there for software team?`',
-        ].join('\n'),
-      },
-      {
-        name: 'SOPs',
-        value: [
-          '`@Icrew password sop url`',
-          '`@Icrew show all sop list`',
-        ].join('\n'),
-      },
-      {
-        name: 'Action Workflows',
-        value: [
-          '`@Icrew issue an LoA to Leo today`',
-          '`@Icrew schedule a 30 minutes meeting with Akshay about overdue tasks today`',
-          'Write actions need Cerebro action APIs and confirmation before changing the database/calendar.',
-        ].join('\n'),
-      }
-    );
-
-  await message.reply({
-    embeds: [embed],
-    allowedMentions: { parse: [] },
-  });
+  await message.reply(toReplyPayload({
+    embeds: [buildHelpEmbed()],
+  }));
 }
 
 async function replyInteractionWithAgentHelp(interaction) {
-  const embed = new EmbedBuilder()
-    .setTitle('Icrew Agent Help')
-    .setDescription('Ask me natural-language questions about attendance, ClickUp tasks, SOPs, and staff status.')
-    .addFields(
-      {
-        name: 'Attendance',
-        value: [
-          '`@Icrew who clocked in today?`',
-          '`@Icrew @Santhosh clockin details`',
-          '`@Icrew who clocked in today but did not do any tasks?`',
-        ].join('\n'),
-      },
-      {
-        name: 'ClickUp Analytics',
-        value: [
-          '`@Icrew @Santhosh status`',
-          '`@Icrew @Santhosh overdue tasks`',
-          '`@Icrew how many overdue tasks are there for software team?`',
-        ].join('\n'),
-      },
-      {
-        name: 'SOPs',
-        value: [
-          '`@Icrew password sop url`',
-          '`@Icrew show all sop list`',
-        ].join('\n'),
-      },
-      {
-        name: 'Action Workflows',
-        value: [
-          '`@Icrew issue an LoA to Leo today`',
-          '`@Icrew schedule a 30 minutes meeting with Akshay about overdue tasks today`',
-          '`@Icrew schedule meeting for one@example.com and two@example.com title: Project update`',
-          'Write actions need confirmation-safe Cerebro APIs before changing database/calendar records.',
-        ].join('\n'),
-      }
-    );
+  await interaction.reply({
+    ...toReplyPayload({ embeds: [buildHelpEmbed()] }),
+    ephemeral: true,
+  });
+}
+
+async function replyInteractionWithDebug(interaction) {
+  const required = [
+    ['View Channel', PermissionsBitField.Flags.ViewChannel],
+    ['Send Messages', PermissionsBitField.Flags.SendMessages],
+    ['Read Message History', PermissionsBitField.Flags.ReadMessageHistory],
+    ['Embed Links', PermissionsBitField.Flags.EmbedLinks],
+    ['Use Application Commands', PermissionsBitField.Flags.UseApplicationCommands],
+  ];
+  const botMember = interaction.guild?.members.me ||
+    (interaction.guild ? await interaction.guild.members.fetchMe() : null);
+  const permissions = botMember && interaction.channel
+    ? interaction.channel.permissionsFor(botMember)
+    : null;
+  const lines = required.map(([label, flag]) =>
+    `${permissions?.has(flag) ? 'OK' : 'MISSING'} ${label}`
+  );
 
   await interaction.reply({
-    embeds: [embed],
+    content: [
+      `Bot: ${interaction.client.user.tag} (${interaction.client.user.id})`,
+      `Guild: ${interaction.guild?.name || 'unknown'} (${interaction.guildId || 'unknown'})`,
+      `Channel: ${interaction.channel?.name || interaction.channelId} (${interaction.channelId})`,
+      '',
+      lines.join('\n'),
+      '',
+      'If View Channel or Send Messages is missing, add the bot role/member to this private channel permissions.',
+      'If all permissions are OK but mentions do not work, enable Message Content Intent in the Discord Developer Portal and restart the bot.',
+    ].join('\n'),
     ephemeral: true,
   });
 }
@@ -418,21 +320,34 @@ async function replyClockedInNoTasksAnalytics(message) {
 
   const lines = noTaskUsers.slice(0, 20).map((group) => {
     const user = group.user || {};
-    return `- ${user.discord_id ? `<@${user.discord_id}>` : user.name || 'Unknown user'}: ${group.clock_ins_count || asArray(group.clock_ins).length} clock-in record(s), 0 ClickUp today tasks`;
+    const mention = user.discord_id ? `<@${user.discord_id}>` : user.name || 'Unknown user';
+    const count = group.clock_ins_count || asArray(group.clock_ins).length;
+    return `${mention} — ${count} clock-in record(s), 0 ClickUp today tasks`;
   });
 
-  await message.reply({
-    content: [
-      'Clocked in today but no ClickUp today tasks found',
-      lines.length ? lines.join('\n') : 'No matching users found.',
-      '',
-      '_Note: this uses ClickUp tasks due today as the task-activity proxy._',
-    ].join('\n').slice(0, 1900),
-    allowedMentions: {
-      parse: [],
-      users: getUniqueDiscordIds(lines),
-    },
+  await message.reply(toReplyPayload({
+    content: formatNoTasksAnalyticsMessage({ lines }),
+    userIds: getUniqueDiscordIds(lines),
+  }));
+}
+
+async function replyWhoClockedIn(message) {
+  const attendanceData = await getClockInDetails();
+  const clockedInUsers = asArray(attendanceData).filter((group) =>
+    group?.is_clocked_in || Number(group?.clock_ins_count || 0) > 0 || asArray(group?.clock_ins).length > 0
+  );
+  const lines = clockedInUsers.slice(0, 30).map((group) => {
+    const user = group.user || {};
+    const count = group.clock_ins_count || asArray(group.clock_ins).length;
+    const state = group.is_clocked_in ? 'Currently clocked in' : `${count} clock-in record(s) today`;
+    const mention = user.discord_id ? `<@${user.discord_id}>` : user.name || 'Unknown user';
+    return `${mention} — ${state}`;
   });
+
+  await message.reply(toReplyPayload({
+    content: formatWhoClockedInMessage({ total: clockedInUsers.length, lines }),
+    userIds: getUniqueDiscordIds(lines),
+  }));
 }
 
 async function replyOverdueTeamAnalytics(message, question) {
@@ -445,52 +360,39 @@ async function replyOverdueTeamAnalytics(message, question) {
     .slice(0, 20)
     .map((group) => {
       const user = group.user || {};
-      return `- ${user.discord_id ? `<@${user.discord_id}>` : user.name || 'Unknown user'}: ${group.count}`;
+      const mention = user.discord_id ? `<@${user.discord_id}>` : user.name || 'Unknown user';
+      return `${mention} — ${group.count} overdue`;
     });
 
-  await message.reply({
-    content: [
-      `Overdue ClickUp tasks${/\bsoftware\b/i.test(question) ? ' for software team' : ''}: ${total}`,
-      lines.length ? lines.join('\n') : 'No overdue tasks found for that team filter.',
-    ].join('\n').slice(0, 1900),
-    allowedMentions: {
-      parse: [],
-      users: getUniqueDiscordIds(lines),
-    },
-  });
+  await message.reply(toReplyPayload({
+    content: formatOverdueTeamMessage({
+      total,
+      teamLabel: /\bsoftware\b/i.test(question) ? 'Software team' : '',
+      lines,
+    }),
+    userIds: getUniqueDiscordIds(lines),
+  }));
 }
 
 async function replyWriteActionGuidance(message, question) {
-  const isLoa = /\b(loa|leave|awol)\b/i.test(question);
-  const isMeeting = /\b(meeting|calendar)\b/i.test(question);
-  const lines = [
-    'I understand this as an action request.',
-  ];
-
-  if (isLoa) {
-    lines.push('LoA creation needs a Cerebro write endpoint with approver/leave-type validation before I can safely modify the database.');
+  const lines = ['I understand this as an action request.'];
+  if (/\b(loa|leave|awol)\b/i.test(question)) {
+    lines.push('LoA creation requires valid approver and leave-type settings in Cerebro.');
   }
+  lines.push('I can still help gather context first, such as overdue tasks or user status.');
 
-  if (isMeeting) {
-    lines.push('Meeting scheduling needs a Cerebro action endpoint using a service/calendar credential, because the current meeting flow depends on a web session Google OAuth token.');
-  }
-
-  lines.push('I can still help gather the context first, for example overdue tasks and the target user status.');
-
-  await message.reply({
-    content: lines.join('\n'),
-    allowedMentions: { parse: [] },
-  });
+  await message.reply(toReplyPayload({
+    content: lines.join('\n\n'),
+  }));
 }
 
 async function handleLoaAction(message, question) {
   const target = getMentionedUsers(message)[0];
 
   if (!target) {
-    await message.reply({
-      content: 'Please mention the user for the LoA, for example `@Icrew issue an LoA to @Santhosh today`.',
-      allowedMentions: { parse: [] },
-    });
+    await message.reply(toReplyPayload({
+      content: 'Please mention the user for the LoA, for example `@ClickUp Bot issue an LoA to @Santhosh today`.',
+    }));
     return;
   }
 
@@ -503,57 +405,69 @@ async function handleLoaAction(message, question) {
   });
   const loa = response.data;
 
-  await message.reply({
-    content: [
-      `LoA ${response.message?.toLowerCase() || 'created'} for <@${target.id}>.`,
-      `Date: ${loa.start_date}${loa.end_date !== loa.start_date ? ` to ${loa.end_date}` : ''}`,
-      `Status: ${loa.status}`,
-      `LoA ID: ${loa.id}`,
-    ].join('\n'),
-    allowedMentions: { parse: [], users: [target.id] },
-  });
+  await message.reply(toReplyPayload({
+    content: formatLoaSuccessMessage({
+      targetId: target.id,
+      loa,
+      messageText: response.message?.toLowerCase() || 'created',
+    }),
+    userIds: [target.id],
+  }));
 }
 
-async function handleMeetingAction(message, question) {
-  const mentionedUsers = getMentionedUsers(message);
-  const emails = extractEmails(question);
+async function replyToMeetingResult(message, result) {
+  if (result.type === 'none') return false;
 
-  if (!mentionedUsers.length && !emails.length) {
-    await message.reply({
-      content: 'Please mention who the meeting is with or provide emails, for example `@Icrew schedule meeting for user@example.com and other@example.com title: Project update`.',
-      allowedMentions: { parse: [] },
-    });
-    return;
+  if (result.type === 'config_error' || result.type === 'error') {
+    await message.reply(toReplyPayload({
+      content: result.message,
+    }));
+    return true;
   }
 
-  const duration = extractDurationMinutes(question);
-  const date = extractDateKeyword(question);
-  const startTime = extractStartTime(question);
-  const topic = extractMeetingTopic(question);
-  const response = await scheduleMeeting({
-    requester_discord_id: message.author.id,
-    attendee_discord_ids: mentionedUsers.map((user) => user.id),
-    attendee_emails: emails,
-    date,
-    start_time: startTime || undefined,
-    duration_minutes: duration,
-    title: `Meeting: ${topic}`.slice(0, 255),
-    topic,
-    include_overdue_tasks: /\boverdue\b/i.test(question),
-  });
-  const meeting = response.data;
-  const targetMentions = mentionedUsers.map((user) => `<@${user.id}>`);
-  const targetText = [...targetMentions, ...emails].join(', ');
+  if (result.type === 'cancelled') {
+    await message.reply(toReplyPayload({
+      content: result.message,
+    }));
+    return true;
+  }
 
-  await message.reply({
-    content: [
-      `Meeting scheduled with ${targetText}.`,
-      `${meeting.date} ${meeting.start_time}-${meeting.end_time} (${meeting.duration_minutes} minutes)`,
-      meeting.task_gist_count ? `Added ${meeting.task_gist_count} overdue-task gist line(s) to the description.` : 'No overdue-task gist was added.',
-      meeting.google_event_link ? `Calendar: ${meeting.google_event_link}` : `Google event ID: ${meeting.google_event_id || 'not returned'}`,
-    ].join('\n'),
-    allowedMentions: { parse: [], users: mentionedUsers.map((user) => user.id) },
+  if (result.type === 'prompt') {
+    await message.reply(toReplyPayload({
+      content: formatMeetingPromptMessage(result.prompt),
+      userIds: result.draft.attendees.map((attendee) => attendee.discordId).filter(Boolean),
+    }));
+    return true;
+  }
+
+  if (result.type === 'success') {
+    await message.reply(toReplyPayload({
+      content: result.note || undefined,
+      embeds: [buildMeetingSuccessEmbed({
+        draft: result.draft,
+        result: result.result,
+        note: result.note,
+        formatDisplayDate,
+        formatDisplayTime,
+      })],
+      userIds: result.draft.attendees.map((attendee) => attendee.discordId).filter(Boolean),
+    }));
+    return true;
+  }
+
+  return false;
+}
+
+async function handleMeetingMessage(message, question, { isExplicitMeetingRequest = false } = {}) {
+  const result = await processMeetingMessage({
+    channelId: message.channel.id,
+    authorId: message.author.id,
+    question,
+    mentionedUsers: getMentionedUsers(message),
+    isExplicitMeetingRequest,
   });
+
+  return replyToMeetingResult(message, result);
 }
 
 async function replyWithUserDashboard(message, target) {
@@ -568,26 +482,20 @@ async function replyWithUserDashboard(message, target) {
   const overdueCount = countItems(overdueData);
   const clockStatus = clockData.is_clocked_in ? 'Currently clocked in' : 'Not clocked in now';
 
-  const embed = new EmbedBuilder()
-    .setTitle(`Status for ${target.displayName || target.username || target.id}`)
-    .setDescription(`<@${target.id}>`)
-    .addFields(
-      {
-        name: 'Attendance',
-        value: `${clockStatus}\n${clockCount} clock-in record${clockCount === 1 ? '' : 's'} today`,
-        inline: false,
-      },
-      {
-        name: 'ClickUp',
-        value: `${pendingCount} pending task${pendingCount === 1 ? '' : 's'}\n${overdueCount} overdue task${overdueCount === 1 ? '' : 's'}`,
-        inline: false,
-      }
-    );
+  const embed = buildDashboardEmbed({
+    target,
+    clockStatus,
+    clockCount,
+    pendingCount,
+    overdueCount,
+  });
 
   await message.reply({
-    embeds: [embed],
+    ...toReplyPayload({
+      embeds: [embed],
+      userIds: [target.id],
+    }),
     components: buildDashboardButtons(target.id),
-    allowedMentions: { parse: [], users: [target.id] },
   });
 }
 
@@ -595,16 +503,23 @@ async function handleDashboardButton(interaction) {
   const [, action, discordId] = interaction.customId.split(':');
 
   if (!discordId) {
-    await interaction.reply({ content: 'Missing dashboard user ID.', ephemeral: true });
+    await interaction.reply({
+      ...toReplyPayload({
+        content: 'Missing dashboard user ID.',
+      }),
+      ephemeral: true,
+    });
     return;
   }
 
   if (action === 'clock') {
     const data = await getClockInDetails({ discordId });
     await interaction.reply({
-      content: formatClockDetails(data, discordId).slice(0, 1900),
+      ...toReplyPayload({
+        content: formatClockDetailsMessage({ discordId, payload: data }),
+        userIds: [discordId],
+      }),
       ephemeral: true,
-      allowedMentions: { parse: [], users: [discordId] },
     });
     return;
   }
@@ -614,11 +529,11 @@ async function handleDashboardButton(interaction) {
   const tasks = getTaskItems(data);
 
   await interaction.reply({
-    content: (tasks.length
-      ? `ClickUp ${filter} tasks for <@${discordId}>\n${tasks.slice(0, 8).map(formatTaskPreview).join('\n')}`
-      : `No ClickUp ${filter} tasks found for <@${discordId}>.`).slice(0, 1900),
+    ...toReplyPayload({
+      content: formatTaskListMessage({ filter, discordId, tasks }),
+      userIds: [discordId],
+    }),
     ephemeral: true,
-    allowedMentions: { parse: [], users: [discordId] },
   });
 }
 
@@ -650,14 +565,17 @@ async function replyWithSopDropdown(message) {
   const components = buildSopSelectMenu(sops);
 
   if (!components.length) {
-    await message.reply('No SOP details found.');
+    await message.reply(toReplyPayload({
+      content: 'No SOP details found.',
+    }));
     return true;
   }
 
   await message.reply({
-    content: 'Select an SOP to get the Cabinet link.',
+    ...toReplyPayload({
+      content: 'Select an SOP from the dropdown to get the Cabinet link.',
+    }),
     components,
-    allowedMentions: { parse: [] },
   });
   return true;
 }
@@ -669,18 +587,21 @@ async function handleSopSelect(interaction) {
 
   if (!sop) {
     await interaction.reply({
-      content: 'I could not find that SOP anymore. Please ask for the SOP list again.',
+      ...toReplyPayload({
+        content: 'I could not find that SOP anymore. Please ask for the SOP list again.',
+      }),
       ephemeral: true,
     });
     return;
   }
 
   await interaction.reply({
-    content: sop.url
-      ? `**${sop.title}**\n${sop.url}`
-      : `**${sop.title}**\nNo Cabinet link is configured for this SOP.`,
+    ...toReplyPayload({
+      content: sop.url
+        ? `**${sop.title}**\n${sop.url}`
+        : `**${sop.title}**\nNo Cabinet link is configured for this SOP.`,
+    }),
     ephemeral: true,
-    allowedMentions: { parse: [] },
   });
 }
 
@@ -690,9 +611,9 @@ async function handleBotMention(message) {
   const question = stripBotMention(message.content, client.user.id);
 
   if (!question) {
-    await message.reply(
-      'Ask me about attendance, clock-in details, ClickUp tasks, or SOP details.'
-    );
+    await message.reply(toReplyPayload({
+      content: formatWelcomeMessage(),
+    }));
     return;
   }
 
@@ -713,6 +634,11 @@ async function handleBotMention(message) {
     return;
   }
 
+  if (wantsWhoClockedIn(question)) {
+    await replyWhoClockedIn(message);
+    return;
+  }
+
   if (wantsOverdueTeamAnalytics(question)) {
     await replyOverdueTeamAnalytics(message, question);
     return;
@@ -729,7 +655,11 @@ async function handleBotMention(message) {
   }
 
   if (wantsMeetingAction(question)) {
-    await handleMeetingAction(message, question);
+    await handleMeetingMessage(message, question, { isExplicitMeetingRequest: true });
+    return;
+  }
+
+  if (await handleMeetingMessage(message, question)) {
     return;
   }
 
@@ -739,7 +669,7 @@ async function handleBotMention(message) {
   }
 
   const requesterMember = message.guild?.members.cache.get(message.author.id);
-  const answer = await answerNaturalLanguageQuestion({
+  const { content, userIds } = await answerNaturalLanguageQuestion({
     question,
     requester: {
       id: message.author.id,
@@ -754,16 +684,13 @@ async function handleBotMention(message) {
   const allowedUserIds = getUniqueDiscordIds([
     message.author.id,
     ...getMentionedUsers(message).map((user) => user.id),
-    ...getDiscordIdsFromText(answer),
+    ...userIds,
   ]);
 
-  await message.reply({
-    content: answer,
-    allowedMentions: {
-      parse: [],
-      users: allowedUserIds,
-    },
-  });
+  await message.reply(toReplyPayload({
+    content,
+    userIds: allowedUserIds,
+  }));
 }
 
 // Validate task ID format (ClickUp task IDs are alphanumeric, e.g. "8xdfdjbgd")
@@ -866,6 +793,14 @@ function handleError(interaction, error) {
 client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   console.log(`✅ Bot is ready! Serving ${client.guilds.cache.size} guild(s)`);
+  console.log(`Cerebro API: ${process.env.CEREBRO_BASE_URL || 'https://cerebro.test'}`);
+  if (
+    process.env.CEREBRO_BASE_URL &&
+    !process.env.CEREBRO_BASE_URL.includes('cerebro.test') &&
+    process.env.CEREBRO_TLS_REJECT_UNAUTHORIZED === 'false'
+  ) {
+    console.warn('CEREBRO_TLS_REJECT_UNAUTHORIZED=false is only recommended for local cerebro.test.');
+  }
 });
 
 // Error event handler
@@ -893,7 +828,9 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       const reply = {
-        content: 'I could not fetch that dashboard detail right now. Please try again later.',
+        ...toReplyPayload({
+          content: 'I could not fetch that dashboard detail right now. Please try again later.',
+        }),
         ephemeral: true,
       };
 
@@ -919,7 +856,9 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       const reply = {
-        content: 'I could not fetch that SOP link right now. Please try again later.',
+        ...toReplyPayload({
+          content: 'I could not fetch that SOP link right now. Please try again later.',
+        }),
         ephemeral: true,
       };
 
@@ -941,6 +880,8 @@ client.on('interactionCreate', async (interaction) => {
       await handleCommentCommand(interaction);
     } else if (interaction.commandName === 'icrew-help') {
       await replyInteractionWithAgentHelp(interaction);
+    } else if (interaction.commandName === 'icrew-debug') {
+      await replyInteractionWithDebug(interaction);
     }
   } catch (error) {
     const status = error.status ?? error.response?.status;
@@ -987,15 +928,22 @@ client.on('messageCreate', async (message) => {
       guildId: message.guildId,
     });
 
-    await message.reply(
-      isConfigError
+    const isMeetingError = error.message?.includes('GOOGLE_MEET_WEBHOOK_URL') ||
+      error.message?.includes('Meeting could not be created');
+
+    await message.reply(toReplyPayload({
+      content: isConfigError
         ? 'CEREBRO_AI_AGENT_TOKEN is missing. Please add it to the bot environment.'
+        : error.message?.includes('GOOGLE_MEET_WEBHOOK_URL')
+        ? 'Meeting scheduling is not configured yet. Please add `GOOGLE_MEET_WEBHOOK_URL` to the bot environment.'
         : isAuthError
         ? 'I could not access the Cerebro AI Agent API. Please check the API token and permissions.'
         : isValidationError
-        ? `Cerebro could not complete that action: ${error.message}${error.apiError ? `\n${error.apiError}` : ''}`
-        : 'I could not fetch those details right now. Please try again later.'
-    );
+        ? `I could not complete that action: ${error.message}${error.apiError ? `\n${error.apiError}` : ''}`
+        : isMeetingError
+        ? `I couldn't schedule that meeting: ${error.message}`
+        : 'I could not fetch those details right now. Please try again later.',
+    }));
   }
 });
 
@@ -1026,6 +974,11 @@ process.on('uncaughtException', (error) => {
 
 // Login to Discord
 client.login(process.env.DISCORD_TOKEN).catch((error) => {
+  if (error.message?.includes('Used disallowed intents')) {
+    console.error(
+      'Discord rejected one of the bot gateway intents. Enable Message Content Intent in the Discord Developer Portal for this bot application, then restart the bot.'
+    );
+  }
   console.error('Failed to login to Discord:', error);
   process.exit(1);
 });
