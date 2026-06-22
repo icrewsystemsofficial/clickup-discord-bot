@@ -9,6 +9,7 @@ const {
 } = require('./cerebro');
 const {
   formatAttendanceMessage,
+  formatClockDetailsMessage,
   formatClickUpTasksMessage,
   formatFallbackHelpMessage,
   formatSopMessage,
@@ -80,12 +81,12 @@ function inferTaskFilter(question) {
 }
 
 function inferSopFilter(question) {
-  const text = question.toLowerCase();
-  if (/\bpassword|passwords|credential|credentials|login\b/.test(text)) return 'password';
-  if (/\bdocument|reference|number\b/.test(text)) return 'document';
-  if (/\bcertificate|certificates\b/.test(text)) return 'certificate';
-  if (/\btravel\b/.test(text)) return 'travel';
-  return '';
+  return String(question || '')
+    .toLowerCase()
+    .replace(/\b(?:i\s+need|need|give|find|get|fetch|open|show|tell\s+me|about|details?|link|url|the|a|an)\b/g, ' ')
+    .replace(/\b(?:sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function buildFallbackPlan({ question, requester, mentionedUsers }) {
@@ -152,7 +153,7 @@ function buildFallbackPlan({ question, requester, mentionedUsers }) {
     }
   }
 
-  if (!actions.length && /\b(sop|procedure|policy)\b/.test(lower)) {
+  if (!actions.length && /\b(sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/.test(lower)) {
     actions.push({
       type: 'sop_details',
       scope: 'all',
@@ -169,7 +170,7 @@ function buildFallbackPlan({ question, requester, mentionedUsers }) {
 function shouldUseDeterministicPlan(context) {
   const lower = context.question.toLowerCase();
   return (
-    /\b(attendance|attendcae|clock ?in|clocked ?in|clocin|clock-in|clocked-in|clock out|clock-out|punched ?in|punch ?in|punch ?out|login|work hours|clickup|task|tasks|sop|procedure|policy)\b/.test(lower) ||
+    /\b(attendance|attendcae|clock ?in|clocked ?in|clocin|clock-in|clocked-in|clock out|clock-out|punched ?in|punch ?in|punch ?out|login|work hours|clickup|task|tasks|sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/.test(lower) ||
     context.mentionedUsers.length > 0
   );
 }
@@ -349,11 +350,21 @@ function pickDiscordId(item, fallbackId) {
 
 function formatDateTime(value) {
   if (!value) return '';
-  if (typeof value === 'number') {
-    const date = new Date(value > 9999999999 ? value : value * 1000);
-    return date.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  }
-  return String(value);
+  const date = typeof value === 'number'
+    ? new Date(value > 9999999999 ? value : value * 1000)
+    : new Date(value);
+
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  return date.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
 }
 
 function formatClockLine(item, fallbackDiscordId) {
@@ -485,7 +496,13 @@ function filterSopItems(items, filter) {
       item.title,
       item.name,
       item.label,
+      item.description,
+      item.type,
+      item.link,
       item.url,
+      ...(Array.isArray(item.tags)
+        ? item.tags.flatMap((tag) => [tag?.name, tag?.value])
+        : []),
     ]
       .filter(Boolean)
       .join(' ')
@@ -519,19 +536,19 @@ async function executeAction(action) {
       discordId: action.scope === 'all' ? '' : discordId,
       date: action.date,
     });
+
+    if (action.scope !== 'all') {
+      return {
+        content: formatClockDetailsMessage({ discordId, payload: data }),
+        userIds: [discordId],
+      };
+    }
+
     const lines = formatClockPayload(data, discordId);
-    const title =
-      action.scope === 'all'
-        ? 'Attendance Details'
-        : 'Attendance Details';
-    const subtitle =
-      action.scope === 'all'
-        ? 'All staff'
-        : `<@${discordId}>`;
 
     const content = formatAttendanceMessage({
-      title,
-      subtitle,
+      title: 'Attendance Details',
+      subtitle: 'All staff',
       lines: lines.slice(0, 20),
       date: action.date || undefined,
     });
@@ -580,11 +597,12 @@ async function executeAction(action) {
   }
 
   if (action.type === 'sop_details') {
-    const data = await getSopDetails({ filter: action.filter });
-    const items = filterSopItems(asArray(data), action.filter).slice(0, 10);
+    const filter = action.filter && action.filter !== 'empty' ? action.filter : '';
+    const data = await getSopDetails({ filter });
+    const items = filterSopItems(asArray(data), filter).slice(0, 10);
 
     return {
-      content: formatSopMessage({ items, filter: action.filter || undefined }),
+      content: formatSopMessage({ items, filter: filter || undefined }),
       userIds: [],
     };
   }

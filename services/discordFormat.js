@@ -34,11 +34,21 @@ function extractMentionIds(values) {
 
 function formatDateTime(value) {
   if (!value) return 'Not set';
-  if (typeof value === 'number') {
-    const date = new Date(value > 9999999999 ? value : value * 1000);
-    return date.toLocaleString('en-IN', { timeZone: TIMEZONE });
-  }
-  return String(value);
+  const date = typeof value === 'number'
+    ? new Date(value > 9999999999 ? value : value * 1000)
+    : new Date(value);
+
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  return date.toLocaleString('en-IN', {
+    timeZone: TIMEZONE,
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
 }
 
 function formatBulletLines(lines, { emptyText = 'No records found.' } = {}) {
@@ -261,24 +271,35 @@ function formatClockDetailsMessage({ discordId, payload }) {
     : Array.isArray(payload?.data)
     ? payload.data
     : [];
-  const isClockedIn = payload?.is_clocked_in ? 'Currently clocked in' : 'Not clocked in now';
+  const isClockedIn = Boolean(payload?.is_clocked_in);
+  const status = isClockedIn ? 'Currently clocked in' : 'Not clocked in now';
 
-  const lines = records.slice(0, 8).map((record) => {
+  const lines = records.slice(0, 8).map((record, index) => {
     const inTime = record.in_time || record.clock_in || record.clockIn;
     const outTime = record.out_time || record.clock_out || record.clockOut;
     const duration = record.duration || record.total_hours || record.work_hours;
+    const isOpen = Boolean(record.is_open) || !outTime;
+    const durationText = record.display_duration || (isOpen || !duration || /^n\/?a$/i.test(String(duration))
+      ? 'In progress'
+      : duration);
+    const inTimeText = record.in_time_ist || formatDateTime(inTime);
+    const outTimeText = record.out_time_ist || formatDateTime(outTime);
+
     return [
-      `In: ${formatDateTime(inTime)}`,
-      `Out: ${formatDateTime(outTime)}`,
-      duration ? `Duration: ${duration}` : null,
+      `**Session ${index + 1}**`,
+      `Clocked in: ${inTimeText} IST`,
+      `Clocked out: ${isOpen ? 'Not yet' : `${outTimeText} IST`}`,
+      `Duration: ${durationText}`,
     ]
       .filter(Boolean)
-      .join(' · ');
+      .join('\n  ');
   });
 
   return truncate([
     `**Clock-in details for** <@${discordId}>`,
-    `Status: ${isClockedIn}`,
+    `**Status:** ${status}`,
+    payload?.date ? `**Date:** ${payload.date}` : null,
+    records.length ? `**Sessions:** ${records.length}` : null,
     '',
     lines.length
       ? formatBulletLines(lines)

@@ -34,6 +34,7 @@ const {
   formatMeetingPromptMessage,
   formatNoTasksAnalyticsMessage,
   formatOverdueTeamMessage,
+  formatSopMessage,
   formatClockDetailsMessage,
   formatTaskListMessage,
   formatWelcomeMessage,
@@ -66,6 +67,10 @@ function stripBotMention(content, botUserId) {
     .trim();
 }
 
+function directlyMentionsBot(content, botUserId) {
+  return new RegExp(`<@!?${botUserId}>`).test(String(content || ''));
+}
+
 function getMentionedUsers(message) {
   return message.mentions.users
     .filter((user) => user.id !== message.client.user.id)
@@ -96,14 +101,58 @@ function asArray(payload) {
   return payload ? [payload] : [];
 }
 
+function normalizeSopRecord(item) {
+  const id = item?.id ?? item?.key ?? item?.cabinet_page_id;
+
+  return {
+    ...item,
+    id: id == null ? '' : String(id),
+    title: item?.title || item?.name || item?.label || 'Untitled SOP',
+    description: item?.description || '',
+    url: item?.link || item?.url || '',
+    priority:
+      item?.priority !== null &&
+      item?.priority !== undefined &&
+      Number.isFinite(Number(item.priority))
+        ? Number(item.priority)
+        : null,
+  };
+}
+
+function normalizeSopPayload(payload) {
+  return asArray(payload)
+    .map(normalizeSopRecord)
+    .filter((sop) => sop.id && sop.title)
+    .sort((a, b) => {
+      if (a.priority !== null && b.priority !== null && a.priority !== b.priority) {
+        return a.priority - b.priority;
+      }
+      if (a.priority !== null) return -1;
+      if (b.priority !== null) return 1;
+      return a.title.localeCompare(b.title);
+    });
+}
+
 function wantsSopDropdown(question) {
-  return /\b(sop|procedure|policy)\b/i.test(question) &&
-    /\b(all|list|dropdown|select|show)\b/i.test(question);
+  return /\b(sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/i.test(question) &&
+    /\b(all|list|dropdown|select)\b/i.test(question);
+}
+
+function wantsSopDetails(question) {
+  return /\b(sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/i.test(question) && !wantsSopDropdown(question);
+}
+
+function extractSopSearch(question) {
+  return String(question || '')
+    .replace(/\b(?:i\s+need|need|give|find|get|fetch|open|show|tell\s+me|about|details?|link|url|the|a|an)\b/gi, ' ')
+    .replace(/\b(?:sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function wantsUserDashboard(question) {
   return /\b(status|dashboard|overview|summary)\b/i.test(question) &&
-    !/\b(sop|procedure|policy)\b/i.test(question);
+    !/\b(sops?|procedures?|polic(?:y|ies)|standard operating procedures?)\b/i.test(question);
 }
 
 function wantsAgentHelp(question) {
@@ -538,30 +587,31 @@ async function handleDashboardButton(interaction) {
 }
 
 function buildSopSelectMenu(sops) {
-  const options = sops
-    .filter((sop) => sop.key && sop.title)
-    .slice(0, 25)
-    .map((sop) => ({
+  const options = sops.slice(0, 125).map((sop) => ({
       label: String(sop.title).slice(0, 100),
-      description: String(sop.url ? 'Cabinet link available' : 'No Cabinet link configured').slice(0, 100),
-      value: String(sop.key).slice(0, 100),
+      description: String(sop.description || (sop.url ? 'Cabinet link available' : 'No Cabinet link configured')).slice(0, 100),
+      value: String(sop.id).slice(0, 100),
     }));
 
   if (!options.length) return [];
 
-  return [
-    new ActionRowBuilder().addComponents(
+  const rows = [];
+  for (let index = 0; index < options.length; index += 25) {
+    const page = Math.floor(index / 25) + 1;
+    rows.push(new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
-        .setCustomId('sop_select')
-        .setPlaceholder('Select an SOP')
-        .addOptions(options)
-    ),
-  ];
+        .setCustomId(`sop_select:${page}`)
+        .setPlaceholder(options.length > 25 ? `Select an SOP (page ${page})` : 'Select an SOP')
+        .addOptions(options.slice(index, index + 25))
+    ));
+  }
+
+  return rows;
 }
 
 async function replyWithSopDropdown(message) {
   const data = await getSopDetails();
-  const sops = asArray(data);
+  const sops = normalizeSopPayload(data);
   const components = buildSopSelectMenu(sops);
 
   if (!components.length) {
@@ -580,10 +630,51 @@ async function replyWithSopDropdown(message) {
   return true;
 }
 
+function sopMatchesSearch(sop, search) {
+  const needle = String(search || '').toLowerCase();
+  const haystack = [
+    sop.title,
+    sop.description,
+    sop.type,
+    sop.url,
+    ...(Array.isArray(sop.tags)
+      ? sop.tags.flatMap((tag) => [tag?.name, tag?.value])
+      : []),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return haystack.includes(needle);
+}
+
+async function replyWithSopDetails(message, question) {
+  const search = extractSopSearch(question);
+
+  if (!search) {
+    await message.reply(toReplyPayload({
+      content: 'Please mention the SOP name, or ask for `all SOP list`.',
+    }));
+    return;
+  }
+
+  const data = await getSopDetails({ filter: search });
+  let sops = normalizeSopPayload(data);
+
+  if (!sops.length) {
+    const allData = await getSopDetails();
+    sops = normalizeSopPayload(allData).filter((sop) => sopMatchesSearch(sop, search));
+  }
+
+  await message.reply(toReplyPayload({
+    content: formatSopMessage({ items: sops.slice(0, 10), filter: search }),
+  }));
+}
+
 async function handleSopSelect(interaction) {
-  const selectedKey = interaction.values?.[0];
+  const selectedId = interaction.values?.[0];
   const data = await getSopDetails();
-  const sop = asArray(data).find((item) => item.key === selectedKey);
+  const sop = normalizeSopPayload(data).find((item) => item.id === selectedId);
 
   if (!sop) {
     await interaction.reply({
@@ -606,7 +697,7 @@ async function handleSopSelect(interaction) {
 }
 
 async function handleBotMention(message) {
-  if (!message.mentions.has(client.user)) return;
+  if (!directlyMentionsBot(message.content, client.user.id)) return;
 
   const question = stripBotMention(message.content, client.user.id);
 
@@ -626,6 +717,11 @@ async function handleBotMention(message) {
 
   if (wantsSopDropdown(question)) {
     await replyWithSopDropdown(message);
+    return;
+  }
+
+  if (wantsSopDetails(question)) {
+    await replyWithSopDetails(message, question);
     return;
   }
 
@@ -701,6 +797,65 @@ function isValidTaskId(taskId) {
   return /^[a-zA-Z0-9_-]+$/.test(trimmed);
 }
 
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function escapeDiscordLinkLabel(value) {
+  return String(value || '').replace(/([\\\[\]])/g, '\\$1');
+}
+
+function linkifyPlainUrls(value) {
+  return String(value || '').replace(
+    /(?<![<(])(https?:\/\/[^\s<>\])]+)/gi,
+    (url) => `<${url}>`
+  );
+}
+
+function getClickUpCommentPartUrl(part) {
+  const attributeLink = part?.attributes?.link;
+  const candidates = [
+    part?.link_mention?.url,
+    part?.bookmark?.url,
+    part?.bookmark?.id,
+    part?.attachment?.url,
+    part?.file?.url,
+    part?.image?.url,
+    part?.video?.url,
+    typeof attributeLink === 'string' ? attributeLink : attributeLink?.url,
+    part?.attributes?.url,
+  ];
+
+  return candidates.find(isHttpUrl) || '';
+}
+
+function formatClickUpComment(comment) {
+  if (Array.isArray(comment?.comment) && comment.comment.length) {
+    return comment.comment
+      .map((part) => {
+        const text = String(part?.text || '');
+        const link = getClickUpCommentPartUrl(part);
+
+        if (isHttpUrl(link)) {
+          return text.trim()
+            ? `[${escapeDiscordLinkLabel(text)}](${link})`
+            : `<${link}>`;
+        }
+
+        return linkifyPlainUrls(text);
+      })
+      .join('')
+      .trim();
+  }
+
+  return linkifyPlainUrls(comment?.comment_text).trim();
+}
+
 // Handle task command
 async function handleTaskCommand(interaction) {
   await interaction.deferReply();
@@ -743,7 +898,10 @@ async function handleCommentCommand(interaction) {
     });
   }
 
-  const comments = await getComments(taskId.trim());
+  const [task, comments] = await Promise.all([
+    getTask(taskId.trim()),
+    getComments(taskId.trim()),
+  ]);
 
   if (!comments || !comments.length) {
     return interaction.editReply({
@@ -753,16 +911,38 @@ async function handleCommentCommand(interaction) {
   
   const comment = comments[0];
   
-  if (!comment || !comment.comment_text) {
+  const commentText = formatClickUpComment(comment);
+
+  if (!comment || !commentText) {
     return interaction.editReply({
       content: 'No valid comments found for this task.',
     });
   }
-  
+
+  const description = commentText.length > 4000
+    ? `${commentText.slice(0, 3980)}\n…comment truncated`
+    : commentText;
+  const author = {
+    name: comment.user?.username || comment.user?.email || 'Unknown User',
+  };
+  if (isHttpUrl(comment.user?.profilePicture)) {
+    author.iconURL = comment.user.profilePicture;
+  }
+
   const embed = new EmbedBuilder()
-    .setAuthor({ name: comment.user?.username || 'Unknown User' })
-    .setDescription(comment.comment_text.slice(0, 400))
-    .setFooter({ text: 'Latest Comment' });
+    .setTitle(task?.name || `ClickUp Task ${taskId.trim()}`)
+    .setAuthor(author)
+    .setDescription(description)
+    .setFooter({ text: `Latest comment · Task ${taskId.trim()}` });
+
+  if (isHttpUrl(task?.url)) {
+    embed.setURL(task.url);
+  }
+
+  const commentDate = Number(comment.date);
+  if (Number.isFinite(commentDate)) {
+    embed.setTimestamp(new Date(commentDate > 9999999999 ? commentDate : commentDate * 1000));
+  }
   
   return interaction.editReply({ embeds: [embed] });
 }
@@ -845,7 +1025,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.isStringSelectMenu()) {
     try {
-      if (interaction.customId === 'sop_select') {
+      if (interaction.customId.startsWith('sop_select')) {
         await handleSopSelect(interaction);
       }
     } catch (error) {
